@@ -1,0 +1,15 @@
+{
+  "name": "postcall",
+  "private": true,
+  "version": "0.1.0",
+  "description": "GET-only AI agent communication protocol on BSV spendable outputs",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "clean": "pnpm -r run clean"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
