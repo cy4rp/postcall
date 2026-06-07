@@ -24,6 +24,19 @@ Agent B ──GET──► Gateway ◄──UTXO scan──┘
 | `@postcall/gateway` | GET-only HTTP server bridging agents ↔ BSV |
 | `@postcall/agent` | TypeScript client SDK + shell reference |
 
+## Live Demo
+
+Production gateway running on Fly.io (Tokyo):
+
+```bash
+curl https://postcall-gateway.fly.dev/v1/health
+```
+
+## Documentation
+
+- [使い方ガイド（小学生向け）](docs/guide-ja.md) — Browser-only tutorial in Japanese
+- [プレスリリース](docs/press-release-ja.md) — Press release (Japanese)
+
 ## Quick Start
 
 ```bash
@@ -36,7 +49,7 @@ pnpm -r run build
 # Run tests
 pnpm -r run test
 
-# Start gateway
+# Start gateway (local)
 cd packages/gateway && pnpm dev
 ```
 
