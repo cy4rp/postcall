@@ -2,6 +2,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createGateway } from '../src/server.js';
 import { genKeyPair, partyId, toHex } from '@postcall/protocol';
 
+function toBase64url(str: string): string {
+  return Buffer.from(str, 'utf8').toString('base64url');
+}
+
 describe('Gateway (GET-only)', () => {
   const gw = createGateway({ port: 0, host: '127.0.0.1' }); // port 0 = random
   let baseUrl: string;
@@ -126,5 +130,77 @@ describe('Gateway (GET-only)', () => {
     const r = await get('/v1/nonexistent') as { error: string; endpoints: string[] };
     expect(r.error).toBe('not found');
     expect(r.endpoints).toBeTruthy();
+  });
+
+  // ---- Mailing List tests ----
+
+  let listId: string;
+
+  it('should create a mailing list', async () => {
+    const name = toBase64url('テスト ML');
+    const r = await get(`/v1/list/create?owner=${pidA}&name=${name}`) as {
+      list_id: string; name: string; owner: string; subscribers: string[];
+    };
+    expect(r.list_id).toBeTruthy();
+    expect(r.name).toBe('テスト ML');
+    expect(r.owner).toBe(pidA);
+    expect(r.subscribers).toContain(pidA);
+    listId = r.list_id;
+  });
+
+  it('should subscribe agent B to list', async () => {
+    const r = await get(`/v1/list/subscribe?list=${listId}&agent=${pidB}`) as {
+      status: string; subscriber_count: number;
+    };
+    expect(r.status).toBe('subscribed');
+    expect(r.subscriber_count).toBe(2);
+  });
+
+  it('should post to list with P2C commitment', async () => {
+    const body = toBase64url('こんにちは ML!');
+    const subject = toBase64url('初めての投稿');
+    const r = await get(`/v1/list/post?list=${listId}&from=${pidA}&subject=${subject}&body=${body}`) as {
+      seq: number; p2c_commitment: string; delivered_to: number; body_text: string;
+    };
+    expect(r.seq).toBe(0);
+    expect(r.p2c_commitment).toBeTruthy();
+    expect(r.delivered_to).toBe(2);
+    expect(r.body_text).toBe('こんにちは ML!');
+  });
+
+  it('should verify list post P2C', async () => {
+    const r = await get(`/v1/list/verify?list=${listId}&seq=0`) as {
+      p2c_valid: boolean; commitment: string; recomputed: string;
+    };
+    expect(r.p2c_valid).toBe(true);
+    expect(r.commitment).toBe(r.recomputed);
+  });
+
+  it('should get list archive', async () => {
+    const r = await get(`/v1/list/archive?list=${listId}`) as {
+      posts: Array<{ seq: number; body_text: string }>; post_count: number;
+    };
+    expect(r.post_count).toBe(1);
+    expect(r.posts[0].body_text).toBe('こんにちは ML!');
+  });
+
+  it('should get subscribers list', async () => {
+    const r = await get(`/v1/list/subscribers?list=${listId}`) as {
+      subscribers: Array<{ agent_id: string; name: string }>; count: number;
+    };
+    expect(r.count).toBe(2);
+  });
+
+  it('should unsubscribe agent B', async () => {
+    const r = await get(`/v1/list/unsubscribe?list=${listId}&agent=${pidB}`) as {
+      status: string; subscriber_count: number;
+    };
+    expect(r.status).toBe('unsubscribed');
+    expect(r.subscriber_count).toBe(1);
+  });
+
+  it('should list all mailing lists', async () => {
+    const r = await get('/v1/lists') as { lists: Array<{ list_id: string }>; count: number };
+    expect(r.count).toBeGreaterThanOrEqual(1);
   });
 });

@@ -23,6 +23,12 @@ import {
   type ConversationState,
   type ConversationStep,
 } from '@postcall/conversation';
+import {
+  listModule,
+  initList,
+  type ListState,
+  type ListStep,
+} from '@postcall/list';
 
 // ---- types ----
 
@@ -45,6 +51,11 @@ interface ConversationRecord {
   readonly token: string;
 }
 
+interface ListRecord {
+  readonly id: string;
+  readonly state: ListState;
+}
+
 // ---- gateway ----
 
 export function createGateway(config: Partial<GatewayConfig> = {}) {
@@ -53,6 +64,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
 
   const agents = new Map<string, AgentRecord>();      // partyIdHex → AgentRecord
   const conversations = new Map<string, ConversationRecord>(); // convId → ConversationRecord
+  const lists = new Map<string, ListRecord>();          // listId → ListRecord
   const relay: RelayCore = createRelay();
 
   // Gateway has its own key pair for constructing P2C commitments
@@ -384,11 +396,260 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     });
   }
 
+  // ---- mailing list handlers ----
+
+  function handleListCreate(params: URLSearchParams, res: ServerResponse) {
+    const owner = params.get('owner');
+    const name = params.get('name');
+
+    if (!owner || !name) return badRequest(res, 'owner and name required');
+    if (!agents.has(owner)) return badRequest(res, 'owner agent not registered');
+
+    // Decode name from base64url if needed
+    let listName: string;
+    try {
+      listName = new TextDecoder().decode(base64urlToBytes(name));
+    } catch {
+      listName = name; // plain text fallback
+    }
+
+    const listId = toHex(taggedHash(
+      HASH_TAGS.state,
+      utf8(`${owner}:${listName}:${Date.now()}`),
+    )).slice(0, 16);
+
+    const state = initList(listId, listName, owner);
+    lists.set(listId, { id: listId, state });
+
+    json(res, 201, {
+      list_id: listId,
+      name: listName,
+      owner,
+      subscribers: state.subscribers,
+      transcript_hash: state.transcriptHash,
+    });
+  }
+
+  function handleListSubscribe(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const agent = params.get('agent');
+
+    if (!listId || !agent) return badRequest(res, 'list and agent required');
+    if (!agents.has(agent)) return badRequest(res, 'agent not registered');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const step: ListStep = { kind: 'subscribe', agent };
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    json(res, 200, {
+      list_id: listId,
+      agent,
+      status: 'subscribed',
+      subscriber_count: result.state.subscribers.length,
+      transcript_hash: result.state.transcriptHash,
+    });
+  }
+
+  function handleListUnsubscribe(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const agent = params.get('agent');
+
+    if (!listId || !agent) return badRequest(res, 'list and agent required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const step: ListStep = { kind: 'unsubscribe', agent };
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    json(res, 200, {
+      list_id: listId,
+      agent,
+      status: 'unsubscribed',
+      subscriber_count: result.state.subscribers.length,
+      transcript_hash: result.state.transcriptHash,
+    });
+  }
+
+  function handleListPost(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const from = params.get('from');
+    const subject = params.get('subject');
+    const body = params.get('body');
+    const replyToStr = params.get('reply_to');
+
+    if (!listId || !from || !body) return badRequest(res, 'list, from, body required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const agent = agents.get(from);
+    if (!agent) return badRequest(res, 'from agent not registered');
+
+    // Decode body from base64url
+    let bodyBytes: Uint8Array;
+    try {
+      bodyBytes = base64urlToBytes(body);
+    } catch {
+      return badRequest(res, 'invalid base64url body');
+    }
+    const bodyHex = toHex(bodyBytes);
+
+    // Decode subject
+    let subjectText: string;
+    if (subject) {
+      try {
+        subjectText = new TextDecoder().decode(base64urlToBytes(subject));
+      } catch {
+        subjectText = subject;
+      }
+    } else {
+      subjectText = '(no subject)';
+    }
+
+    // Create P2C commitment
+    const pub = fromHex(agent.pubHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const p2cHex = toHex(p2c.tweakedPubCompressed);
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const replyTo = replyToStr !== null ? parseInt(replyToStr, 10) : undefined;
+
+    const step: ListStep = {
+      kind: 'post',
+      from,
+      subject: subjectText,
+      bodyHex,
+      p2cCommitment: p2cHex,
+      timestamp,
+      replyTo: isNaN(replyTo as number) ? undefined : replyTo,
+    };
+
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    json(res, 200, {
+      list_id: listId,
+      seq: result.state.nextSeq - 1,
+      from,
+      subject: subjectText,
+      body_text: new TextDecoder().decode(bodyBytes),
+      p2c_commitment: p2cHex,
+      transcript_hash: result.state.transcriptHash,
+      delivered_to: result.state.subscribers.length,
+    });
+  }
+
+  function handleListArchive(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    if (!listId) return badRequest(res, 'list required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    json(res, 200, {
+      list_id: listId,
+      name: record.state.name,
+      owner: record.state.owner,
+      subscribers: record.state.subscribers,
+      subscriber_count: record.state.subscribers.length,
+      phase: record.state.phase,
+      transcript_hash: record.state.transcriptHash,
+      post_count: record.state.posts.length,
+      posts: record.state.posts.map(p => ({
+        seq: p.seq,
+        from: p.from,
+        subject: p.subject,
+        body_text: hexToUtf8(p.bodyHex),
+        p2c_commitment: p.p2cCommitment,
+        timestamp: p.timestamp,
+        reply_to: p.replyTo,
+      })),
+    });
+  }
+
+  function handleListSubscribers(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    if (!listId) return badRequest(res, 'list required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const subscriberDetails = record.state.subscribers.map(s => {
+      const a = agents.get(s);
+      return { agent_id: s, name: a?.name ?? 'unknown' };
+    });
+
+    json(res, 200, {
+      list_id: listId,
+      name: record.state.name,
+      subscribers: subscriberDetails,
+      count: subscriberDetails.length,
+    });
+  }
+
+  function handleListVerify(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const seq = params.get('seq');
+
+    if (!listId || seq === null) return badRequest(res, 'list and seq required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const seqNum = parseInt(seq, 10);
+    const post = record.state.posts.find(p => p.seq === seqNum);
+    if (!post) return badRequest(res, 'post not found');
+
+    const agent = agents.get(post.from);
+    if (!agent) return badRequest(res, 'sender agent not found');
+
+    // Verify P2C commitment
+    const pub = fromHex(agent.pubHex);
+    const bodyBytes = fromHex(post.bodyHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const recomputedHex = toHex(p2c.tweakedPubCompressed);
+    const p2cValid = recomputedHex === post.p2cCommitment;
+
+    json(res, 200, {
+      list_id: listId,
+      seq: seqNum,
+      p2c_valid: p2cValid,
+      commitment: post.p2cCommitment,
+      recomputed: recomputedHex,
+      subject: post.subject,
+      body_text: hexToUtf8(post.bodyHex),
+    });
+  }
+
+  function handleLists(_params: URLSearchParams, res: ServerResponse) {
+    const allLists = [...lists.values()].map(r => ({
+      list_id: r.id,
+      name: r.state.name,
+      owner: r.state.owner,
+      subscriber_count: r.state.subscribers.length,
+      post_count: r.state.posts.length,
+      phase: r.state.phase,
+    }));
+    json(res, 200, { lists: allLists, count: allLists.length });
+  }
+
   function handleHealth(_params: URLSearchParams, res: ServerResponse) {
     json(res, 200, {
       status: 'ok',
       agents: agents.size,
       conversations: conversations.size,
+      lists: lists.size,
       relay_channels: relay.channelCount(),
       gateway_id: toHex(partyId(gatewayKp.pub)),
     });
@@ -418,6 +679,15 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       case '/v1/verify':   return handleVerify(params, res);
       case '/v1/settle':   return handleSettle(params, res);
       case '/v1/health':   return handleHealth(params, res);
+      // Mailing list endpoints
+      case '/v1/list/create':      return handleListCreate(params, res);
+      case '/v1/list/subscribe':   return handleListSubscribe(params, res);
+      case '/v1/list/unsubscribe': return handleListUnsubscribe(params, res);
+      case '/v1/list/post':        return handleListPost(params, res);
+      case '/v1/list/archive':     return handleListArchive(params, res);
+      case '/v1/list/subscribers': return handleListSubscribers(params, res);
+      case '/v1/list/verify':      return handleListVerify(params, res);
+      case '/v1/lists':            return handleLists(params, res);
       default:
         json(res, 404, {
           error: 'not found',
@@ -426,6 +696,10 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
             'GET /v1/inbox', 'GET /v1/thread', 'GET /v1/listen',
             'GET /v1/agents', 'GET /v1/verify', 'GET /v1/settle',
             'GET /v1/health',
+            'GET /v1/list/create', 'GET /v1/list/subscribe',
+            'GET /v1/list/unsubscribe', 'GET /v1/list/post',
+            'GET /v1/list/archive', 'GET /v1/list/subscribers',
+            'GET /v1/list/verify', 'GET /v1/lists',
           ],
         });
     }
@@ -448,6 +722,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     server,
     agents,
     conversations,
+    lists,
     relay,
   };
 }
