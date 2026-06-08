@@ -7,6 +7,7 @@ WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json tsconfig.json ./
 COPY packages/protocol/package.json packages/protocol/tsconfig.json packages/protocol/
 COPY packages/conversation/package.json packages/conversation/tsconfig.json packages/conversation/
+COPY packages/list/package.json packages/list/tsconfig.json packages/list/
 COPY packages/gateway/package.json packages/gateway/tsconfig.json packages/gateway/
 COPY packages/agent/package.json packages/agent/tsconfig.json packages/agent/
 
@@ -14,6 +15,7 @@ RUN pnpm install --frozen-lockfile
 
 COPY packages/protocol/src packages/protocol/src
 COPY packages/conversation/src packages/conversation/src
+COPY packages/list/src packages/list/src
 COPY packages/gateway/src packages/gateway/src
 COPY packages/agent/src packages/agent/src
 
@@ -30,6 +32,8 @@ COPY --from=builder /app/packages/protocol/package.json packages/protocol/
 COPY --from=builder /app/packages/protocol/dist packages/protocol/dist
 COPY --from=builder /app/packages/conversation/package.json packages/conversation/
 COPY --from=builder /app/packages/conversation/dist packages/conversation/dist
+COPY --from=builder /app/packages/list/package.json packages/list/
+COPY --from=builder /app/packages/list/dist packages/list/dist
 COPY --from=builder /app/packages/gateway/package.json packages/gateway/
 COPY --from=builder /app/packages/gateway/dist packages/gateway/dist
 COPY --from=builder /app/packages/agent/package.json packages/agent/
