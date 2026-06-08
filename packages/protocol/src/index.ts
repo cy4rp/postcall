@@ -54,3 +54,27 @@ export {
   type RelayLimits,
   DEFAULT_RELAY_LIMITS,
 } from './relay.js';
+
+export {
+  type TxInput,
+  type TxOutput,
+  type SignedInput,
+  type BuiltTransaction,
+  writeVarInt,
+  p2pkhScript,
+  p2pkhScriptFromPub,
+  p2pkhScriptSig,
+  sighashPreimage,
+  serializeTransaction,
+  computeTxid,
+  signInput,
+  buildP2CTransaction,
+  base58Check,
+  base58CheckDecode,
+  pubkeyToAddress,
+  privkeyToWif,
+  wifToPrivkey,
+  privToCompressedPub,
+  DUST_SATOSHIS,
+  DEFAULT_FEE_RATE,
+} from './bsv.js';

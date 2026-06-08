@@ -29,12 +29,14 @@ import {
   type ListState,
   type ListStep,
 } from '@postcall/list';
+import { GatewayWallet, type BroadcastResult } from './wallet.js';
 
 // ---- types ----
 
 export interface GatewayConfig {
   readonly port: number;
   readonly host: string;
+  readonly bsvWalletKey?: string; // WIF or hex private key for BSV testnet wallet
 }
 
 interface AgentRecord {
@@ -69,6 +71,10 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
 
   // Gateway has its own key pair for constructing P2C commitments
   const gatewayKp = genKeyPair();
+
+  // BSV testnet wallet (pays for on-chain transactions)
+  const wallet = new GatewayWallet(config.bsvWalletKey);
+  let walletRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
   function json(res: ServerResponse, status: number, body: unknown) {
     res.writeHead(status, {
@@ -151,7 +157,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     });
   }
 
-  function handleSend(params: URLSearchParams, res: ServerResponse) {
+  async function handleSend(params: URLSearchParams, res: ServerResponse) {
     const conv = params.get('conv');
     const from = params.get('from');
     const type = params.get('type') as 'msg' | 'req' | 'res' | 'ack' | undefined;
@@ -224,12 +230,19 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     const relayHex = toHex(utf8(JSON.stringify(relayMsg)));
     relay.publish(conv, record.token, relayHex);
 
+    // Broadcast P2C commitment to BSV testnet
+    let txResult: BroadcastResult | null = null;
+    if (wallet.isFunded()) {
+      txResult = await wallet.broadcastP2C(p2c.tweakedPubCompressed);
+    }
+
     json(res, 200, {
       conversation_id: conv,
       seq: result.state.nextSeq - 1,
       transcript_hash: result.state.transcriptHash,
       p2c_commitment: p2cHex,
       body_text: new TextDecoder().decode(bodyBytes),
+      ...(txResult ? { txid: txResult.txid, explorer_url: txResult.explorerUrl, fee_satoshis: Number(txResult.fee) } : { txid: null, on_chain: false }),
     });
   }
 
@@ -479,7 +492,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     });
   }
 
-  function handleListPost(params: URLSearchParams, res: ServerResponse) {
+  async function handleListPost(params: URLSearchParams, res: ServerResponse) {
     const listId = params.get('list');
     const from = params.get('from');
     const subject = params.get('subject');
@@ -538,6 +551,12 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
 
     lists.set(listId, { ...record, state: result.state });
 
+    // Broadcast P2C commitment to BSV testnet
+    let txResult: BroadcastResult | null = null;
+    if (wallet.isFunded()) {
+      txResult = await wallet.broadcastP2C(p2c.tweakedPubCompressed);
+    }
+
     json(res, 200, {
       list_id: listId,
       seq: result.state.nextSeq - 1,
@@ -547,6 +566,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       p2c_commitment: p2cHex,
       transcript_hash: result.state.transcriptHash,
       delivered_to: result.state.subscribers.length,
+      ...(txResult ? { txid: txResult.txid, explorer_url: txResult.explorerUrl, fee_satoshis: Number(txResult.fee) } : { txid: null, on_chain: false }),
     });
   }
 
@@ -644,6 +664,19 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     json(res, 200, { lists: allLists, count: allLists.length });
   }
 
+  function handleWallet(_params: URLSearchParams, res: ServerResponse) {
+    const status = wallet.getStatus();
+    json(res, 200, {
+      address: status.address,
+      balance_satoshis: Number(status.balance),
+      utxo_count: status.utxoCount,
+      network: status.network,
+      funded: status.funded,
+      explorer_url: status.explorerUrl,
+      faucets: status.faucets,
+    });
+  }
+
   function handleHealth(_params: URLSearchParams, res: ServerResponse) {
     json(res, 200, {
       status: 'ok',
@@ -652,6 +685,11 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       lists: lists.size,
       relay_channels: relay.channelCount(),
       gateway_id: toHex(partyId(gatewayKp.pub)),
+      bsv_wallet: {
+        address: wallet.address,
+        funded: wallet.isFunded(),
+        balance_satoshis: Number(wallet.getBalance()),
+      },
     });
   }
 
@@ -678,6 +716,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       case '/v1/agents':   return handleAgents(params, res);
       case '/v1/verify':   return handleVerify(params, res);
       case '/v1/settle':   return handleSettle(params, res);
+      case '/v1/wallet':   return handleWallet(params, res);
       case '/v1/health':   return handleHealth(params, res);
       // Mailing list endpoints
       case '/v1/list/create':      return handleListCreate(params, res);
@@ -695,7 +734,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
             'GET /v1/register', 'GET /v1/open', 'GET /v1/send',
             'GET /v1/inbox', 'GET /v1/thread', 'GET /v1/listen',
             'GET /v1/agents', 'GET /v1/verify', 'GET /v1/settle',
-            'GET /v1/health',
+            'GET /v1/wallet', 'GET /v1/health',
             'GET /v1/list/create', 'GET /v1/list/subscribe',
             'GET /v1/list/unsubscribe', 'GET /v1/list/post',
             'GET /v1/list/archive', 'GET /v1/list/subscribers',
@@ -706,7 +745,21 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
   });
 
   return {
-    start() {
+    async start() {
+      // Initialize BSV wallet
+      console.log(`[wallet] BSV testnet address: ${wallet.address}`);
+      console.log(`[wallet] Explorer: https://test.whatsonchain.com/address/${wallet.address}`);
+      await wallet.refreshUtxos();
+      if (!wallet.isFunded()) {
+        console.log('[wallet] NOT FUNDED — transactions will be off-chain only');
+        console.log('[wallet] Fund this address to enable on-chain broadcasting:');
+        console.log(`[wallet]   ${wallet.address}`);
+        console.log('[wallet] Faucets: https://bsvfaucet.com  https://scrypt.io/faucet');
+      } else {
+        console.log(`[wallet] Funded: ${wallet.getBalance()} satoshis, ${wallet.getUtxoCount()} UTXOs`);
+      }
+      walletRefreshTimer = wallet.startPeriodicRefresh(60_000);
+
       return new Promise<void>((resolve) => {
         server.listen(port, host, () => {
           console.log(`postcall gateway listening on http://${host}:${port}`);
@@ -715,6 +768,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       });
     },
     stop() {
+      if (walletRefreshTimer) clearInterval(walletRefreshTimer);
       return new Promise<void>((resolve, reject) => {
         server.close((err) => err ? reject(err) : resolve());
       });
@@ -724,6 +778,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     conversations,
     lists,
     relay,
+    wallet,
   };
 }
 
@@ -749,6 +804,9 @@ function hexToUtf8(hex: string): string {
 // ---- main ----
 
 if (process.argv[1] && (process.argv[1].endsWith('/index.ts') || process.argv[1].endsWith('/index.js') || process.argv[1].endsWith('/server.ts') || process.argv[1].endsWith('/server.js'))) {
-  const gw = createGateway({ port: parseInt(process.env['PORT'] ?? '3000', 10) });
+  const gw = createGateway({
+    port: parseInt(process.env['PORT'] ?? '3000', 10),
+    bsvWalletKey: process.env['BSV_WALLET_WIF'] ?? process.env['BSV_WALLET_KEY'],
+  });
   gw.start();
 }
