@@ -16,6 +16,9 @@ import {
   utf8,
   createRelay,
   type RelayCore,
+  privkeyToWif,
+  privToCompressedPub,
+  pubkeyToAddress,
 } from '@postcall/protocol';
 import {
   conversationModule,
@@ -89,6 +92,42 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
   }
 
   // ---- handlers ----
+
+  function handleKeygen(params: URLSearchParams, res: ServerResponse) {
+    const name = params.get('name') ?? 'unnamed';
+    const autoRegister = params.get('register') !== 'false';
+
+    // Generate fresh secp256k1 key pair
+    const kp = genKeyPair();
+    const compressed = privToCompressedPub(kp.priv);
+    const pid = partyId(kp.pub);
+    const pidHex = toHex(pid);
+    const wif = privkeyToWif(kp.priv, true, true); // testnet, compressed
+    const address = pubkeyToAddress(compressed, true); // testnet
+
+    // Auto-register unless ?register=false
+    if (autoRegister && !agents.has(pidHex)) {
+      agents.set(pidHex, {
+        name,
+        partyIdHex: pidHex,
+        pubHex: toHex(kp.pub),
+        capabilities: [],
+        registeredAt: Math.floor(Date.now() / 1000),
+      });
+    }
+
+    json(res, 201, {
+      agent_id: pidHex,
+      name,
+      registered: autoRegister,
+      public_key: toHex(kp.pub),
+      public_key_compressed: toHex(compressed),
+      private_key_hex: toHex(kp.priv),
+      private_key_wif: wif,
+      bsv_address: address,
+      warning: 'Save your private_key_wif securely. Anyone with this key can act as you. This key will NOT be shown again.',
+    });
+  }
 
   function handleRegister(params: URLSearchParams, res: ServerResponse) {
     const pubHex = params.get('pubkey');
@@ -707,6 +746,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
     const params = url.searchParams;
 
     switch (path) {
+      case '/v1/keygen':   return handleKeygen(params, res);
       case '/v1/register': return handleRegister(params, res);
       case '/v1/open':     return handleOpen(params, res);
       case '/v1/send':     return handleSend(params, res);
@@ -731,7 +771,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
         json(res, 404, {
           error: 'not found',
           endpoints: [
-            'GET /v1/register', 'GET /v1/open', 'GET /v1/send',
+            'GET /v1/keygen', 'GET /v1/register', 'GET /v1/open', 'GET /v1/send',
             'GET /v1/inbox', 'GET /v1/thread', 'GET /v1/listen',
             'GET /v1/agents', 'GET /v1/verify', 'GET /v1/settle',
             'GET /v1/wallet', 'GET /v1/health',
