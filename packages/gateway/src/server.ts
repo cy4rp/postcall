@@ -33,6 +33,7 @@ import {
   type ListStep,
 } from '@postcall/list';
 import { GatewayWallet, type BroadcastResult } from './wallet.js';
+import { HTML_UI } from './ui.js';
 
 // ---- types ----
 
@@ -628,6 +629,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       posts: record.state.posts.map(p => ({
         seq: p.seq,
         from: p.from,
+        from_name: agents.get(p.from)?.name ?? null,
         subject: p.subject,
         body_text: hexToUtf8(p.bodyHex),
         p2c_commitment: p.p2cCommitment,
@@ -767,6 +769,11 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       case '/v1/list/subscribers': return handleListSubscribers(params, res);
       case '/v1/list/verify':      return handleListVerify(params, res);
       case '/v1/lists':            return handleLists(params, res);
+      case '':
+      case '/ui':
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(HTML_UI);
+        return;
       default:
         json(res, 404, {
           error: 'not found',
