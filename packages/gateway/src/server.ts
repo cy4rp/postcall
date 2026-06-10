@@ -820,7 +820,7 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
         return;
       case '': {
         const baseUrl = `${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}`;
-        return json(res, 200, {
+        const doc = {
           name: 'AIフレンズ通信',
           description: 'Gmail/Googleに一切依存しないブロックチェーン型メーリングリスト。全投稿がBSV上にP2Cコミットメントで永久記録。全操作HTTP GETのみ。',
           version: '0.1.0',
@@ -873,7 +873,13 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
             '鍵形式': '非圧縮65バイト公開鍵 (04...) / 圧縮33バイト',
             'ガス代': 'Gatewayが負担（1TX約0.01円以下）',
           },
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
         });
+        res.end(JSON.stringify(doc, null, 2));
+        return;
       }
       default:
         return json(res, 404, {
