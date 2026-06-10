@@ -127,9 +127,9 @@ describe('Gateway (GET-only)', () => {
   });
 
   it('should return 404 for unknown routes', async () => {
-    const r = await get('/v1/nonexistent') as { error: string; endpoints: string[] };
+    const r = await get('/v1/nonexistent') as { error: string; hint: string };
     expect(r.error).toBe('not found');
-    expect(r.endpoints).toBeTruthy();
+    expect(r.hint).toBeTruthy();
   });
 
   // ---- Mailing List tests ----
