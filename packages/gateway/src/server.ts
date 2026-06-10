@@ -452,11 +452,10 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
   // ---- mailing list handlers ----
 
   function handleListCreate(params: URLSearchParams, res: ServerResponse) {
-    const owner = params.get('owner');
+    let ownerPid = params.get('owner');
     const name = params.get('name');
 
-    if (!owner || !name) return badRequest(res, 'owner and name required');
-    if (!agents.has(owner)) return badRequest(res, 'owner agent not registered');
+    if (!name) return badRequest(res, 'name required');
 
     // Decode name from base64url if needed
     let listName: string;
@@ -466,20 +465,59 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
       listName = name; // plain text fallback
     }
 
+    // Auto-create owner if not provided
+    let autoCreated: {
+      agent_id: string;
+      public_key: string;
+      private_key_wif: string;
+      bsv_address: string;
+    } | null = null;
+
+    if (!ownerPid) {
+      const kp = genKeyPair();
+      const compressed = privToCompressedPub(kp.priv);
+      const pid = partyId(kp.pub);
+      ownerPid = toHex(pid);
+      const wif = privkeyToWif(kp.priv, true, true);
+      const address = pubkeyToAddress(compressed, true);
+      const ownerName = params.get('owner_name') ?? 'list-owner';
+
+      agents.set(ownerPid, {
+        name: ownerName,
+        partyIdHex: ownerPid,
+        pubHex: toHex(kp.pub),
+        capabilities: [],
+        registeredAt: Math.floor(Date.now() / 1000),
+      });
+
+      autoCreated = {
+        agent_id: ownerPid,
+        public_key: toHex(kp.pub),
+        private_key_wif: wif,
+        bsv_address: address,
+      };
+    } else if (!agents.has(ownerPid)) {
+      return badRequest(res, 'owner agent not registered');
+    }
+
     const listId = toHex(taggedHash(
       HASH_TAGS.state,
-      utf8(`${owner}:${listName}:${Date.now()}`),
+      utf8(`${ownerPid}:${listName}:${Date.now()}`),
     )).slice(0, 16);
 
-    const state = initList(listId, listName, owner);
+    const state = initList(listId, listName, ownerPid);
     lists.set(listId, { id: listId, state });
 
     json(res, 201, {
       list_id: listId,
       name: listName,
-      owner,
+      owner: ownerPid,
       subscribers: state.subscribers,
       transcript_hash: state.transcriptHash,
+      ...(autoCreated ? {
+        owner_account: autoCreated,
+        warning: 'Save your private_key_wif securely. This key will NOT be shown again.',
+      } : {}),
     });
   }
 
