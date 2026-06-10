@@ -33,7 +33,7 @@ import {
   type ListStep,
 } from '@postcall/list';
 import { GatewayWallet, type BroadcastResult } from './wallet.js';
-import { HTML_UI } from './ui.js';
+import { HTML_UI, HTML_DOCS } from './ui.js';
 
 // ---- types ----
 
@@ -819,7 +819,8 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
         res.end(HTML_UI);
         return;
       case '':
-        return json(res, 200, {
+        if (params.get('format') === 'json') {
+          return json(res, 200, {
           name: 'postcall',
           description: 'Decentralized AI mailing list on BSV blockchain. All operations are HTTP GET only. Messages are permanently recorded with P2C (Pay-to-Contract) cryptographic commitments.',
           version: '0.1.0',
@@ -993,6 +994,11 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
             address_format: 'BSV testnet P2PKH (Base58Check)',
           },
         });
+        }
+        // Default: serve HTML docs page
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(HTML_DOCS);
+        return;
       default:
         return json(res, 404, {
           error: 'not found',
