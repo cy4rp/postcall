@@ -1,0 +1,957 @@
+// @postcall/gateway — GET-only HTTP server
+//
+// Every endpoint is GET. AI agents interact using only curl/wget.
+// The Gateway translates GET requests into BSV transactions + relay messages.
+
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  genKeyPair,
+  partyId,
+  toHex,
+  fromHex,
+  verifyData,
+  commitP2C,
+  taggedHash,
+  HASH_TAGS,
+  utf8,
+  createRelay,
+  type RelayCore,
+  privkeyToWif,
+  privToCompressedPub,
+  pubkeyToAddress,
+} from '@postcall/protocol';
+import {
+  conversationModule,
+  initConversation,
+  type ConversationState,
+  type ConversationStep,
+} from '@postcall/conversation';
+import {
+  listModule,
+  initList,
+  type ListState,
+  type ListStep,
+} from '@postcall/list';
+import { GatewayWallet, type BroadcastResult } from './wallet.js';
+import { HTML_UI } from './ui.js';
+
+// ---- types ----
+
+export interface GatewayConfig {
+  readonly port: number;
+  readonly host: string;
+  readonly bsvWalletKey?: string; // WIF or hex private key for BSV testnet wallet
+}
+
+interface AgentRecord {
+  readonly name: string;
+  readonly partyIdHex: string;
+  readonly pubHex: string;
+  readonly capabilities: string[];
+  readonly registeredAt: number;
+}
+
+interface ConversationRecord {
+  readonly id: string;
+  readonly state: ConversationState;
+  readonly token: string;
+}
+
+interface ListRecord {
+  readonly id: string;
+  readonly state: ListState;
+}
+
+// ---- gateway ----
+
+export function createGateway(config: Partial<GatewayConfig> = {}) {
+  const port = config.port ?? 3000;
+  const host = config.host ?? '0.0.0.0';
+
+  const agents = new Map<string, AgentRecord>();      // partyIdHex → AgentRecord
+  const conversations = new Map<string, ConversationRecord>(); // convId → ConversationRecord
+  const lists = new Map<string, ListRecord>();          // listId → ListRecord
+  const relay: RelayCore = createRelay();
+
+  // Gateway has its own key pair for constructing P2C commitments
+  const gatewayKp = genKeyPair();
+
+  // BSV testnet wallet (pays for on-chain transactions)
+  const wallet = new GatewayWallet(config.bsvWalletKey);
+  let walletRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+  function json(res: ServerResponse, status: number, body: unknown) {
+    res.writeHead(status, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify(body));
+  }
+
+  function badRequest(res: ServerResponse, msg: string) {
+    json(res, 400, { error: msg });
+  }
+
+  // ---- handlers ----
+
+  function handleKeygen(params: URLSearchParams, res: ServerResponse) {
+    const name = params.get('name') ?? 'unnamed';
+    const autoRegister = params.get('register') !== 'false';
+
+    // Generate fresh secp256k1 key pair
+    const kp = genKeyPair();
+    const compressed = privToCompressedPub(kp.priv);
+    const pid = partyId(kp.pub);
+    const pidHex = toHex(pid);
+    const wif = privkeyToWif(kp.priv, true, true); // testnet, compressed
+    const address = pubkeyToAddress(compressed, true); // testnet
+
+    // Auto-register unless ?register=false
+    if (autoRegister && !agents.has(pidHex)) {
+      agents.set(pidHex, {
+        name,
+        partyIdHex: pidHex,
+        pubHex: toHex(kp.pub),
+        capabilities: [],
+        registeredAt: Math.floor(Date.now() / 1000),
+      });
+    }
+
+    json(res, 201, {
+      agent_id: pidHex,
+      name,
+      registered: autoRegister,
+      public_key: toHex(kp.pub),
+      public_key_compressed: toHex(compressed),
+      private_key_hex: toHex(kp.priv),
+      private_key_wif: wif,
+      bsv_address: address,
+      warning: 'Save your private_key_wif securely. Anyone with this key can act as you. This key will NOT be shown again.',
+    });
+  }
+
+  function handleRegister(params: URLSearchParams, res: ServerResponse) {
+    const pubHex = params.get('pubkey');
+    const name = params.get('name') ?? 'unnamed';
+    const caps = params.get('caps')?.split(',') ?? [];
+
+    if (!pubHex) return badRequest(res, 'pubkey required');
+
+    let pub: Uint8Array;
+    try {
+      pub = fromHex(pubHex);
+    } catch {
+      return badRequest(res, 'invalid pubkey hex');
+    }
+
+    let pid: Uint8Array;
+    try {
+      pid = partyId(pub);
+    } catch {
+      return badRequest(res, 'pubkey must be 65B uncompressed');
+    }
+
+    const pidHex = toHex(pid);
+
+    if (agents.has(pidHex)) {
+      return json(res, 200, { agent_id: pidHex, status: 'already_registered' });
+    }
+
+    agents.set(pidHex, {
+      name,
+      partyIdHex: pidHex,
+      pubHex,
+      capabilities: caps,
+      registeredAt: Math.floor(Date.now() / 1000),
+    });
+
+    json(res, 201, { agent_id: pidHex, name, capabilities: caps });
+  }
+
+  function handleOpen(params: URLSearchParams, res: ServerResponse) {
+    const from = params.get('from');
+    const to = params.get('to');
+
+    if (!from || !to) return badRequest(res, 'from and to required');
+    if (!agents.has(from)) return badRequest(res, 'from agent not registered');
+    if (!agents.has(to)) return badRequest(res, 'to agent not registered');
+
+    // Generate conversation ID
+    const convId = toHex(taggedHash(
+      HASH_TAGS.state,
+      utf8(`${from}:${to}:${Date.now()}`),
+    )).slice(0, 16);
+
+    const state = initConversation(convId, [from, to]);
+    const token = toHex(taggedHash(HASH_TAGS.state, utf8(convId + ':token'))).slice(0, 32);
+
+    // Open relay channel
+    relay.open(convId, token);
+
+    conversations.set(convId, { id: convId, state, token });
+
+    json(res, 201, {
+      conversation_id: convId,
+      participants: [from, to],
+      transcript_hash: state.transcriptHash,
+    });
+  }
+
+  async function handleSend(params: URLSearchParams, res: ServerResponse) {
+    const conv = params.get('conv');
+    const from = params.get('from');
+    const type = params.get('type') as 'msg' | 'req' | 'res' | 'ack' | undefined;
+    const body = params.get('body');
+    const sig = params.get('sig');
+
+    if (!conv || !from || !body) return badRequest(res, 'conv, from, body required');
+
+    const record = conversations.get(conv);
+    if (!record) return badRequest(res, 'conversation not found');
+
+    const agent = agents.get(from);
+    if (!agent) return badRequest(res, 'from agent not registered');
+
+    // Decode body from base64url
+    let bodyBytes: Uint8Array;
+    try {
+      bodyBytes = base64urlToBytes(body);
+    } catch {
+      return badRequest(res, 'invalid base64url body');
+    }
+    const bodyHex = toHex(bodyBytes);
+
+    // Verify signature if provided
+    if (sig) {
+      try {
+        const pub = fromHex(agent.pubHex);
+        const valid = verifyData(bodyBytes, fromHex(sig), pub);
+        if (!valid) return json(res, 401, { error: 'invalid signature' });
+      } catch {
+        return json(res, 401, { error: 'signature verification failed' });
+      }
+    }
+
+    // Create P2C commitment for this message
+    const pub = fromHex(agent.pubHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const p2cHex = toHex(p2c.tweakedPubCompressed);
+
+    const messageKind = type ?? 'msg';
+    const timestamp = Math.floor(Date.now() / 1000);
+
+    // Apply step to conversation state machine
+    const step: ConversationStep = {
+      kind: 'message',
+      from,
+      messageKind,
+      bodyHex,
+      p2cCommitment: p2cHex,
+      timestamp,
+    };
+
+    const result = conversationModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    // Update state
+    conversations.set(conv, { ...record, state: result.state });
+
+    // Publish to relay as raw message (gateway does not sign on behalf of agents)
+    const relayMsg = {
+      conversationId: conv,
+      from,
+      to: record.state.participants.find(p => p !== from) ?? '*',
+      messageKind,
+      sequenceNo: result.state.nextSeq - 1,
+      bodyHex,
+      timestamp,
+      p2cCommitment: p2cHex,
+    };
+    const relayHex = toHex(utf8(JSON.stringify(relayMsg)));
+    relay.publish(conv, record.token, relayHex);
+
+    // Broadcast P2C commitment to BSV testnet
+    let txResult: BroadcastResult | null = null;
+    if (wallet.isFunded()) {
+      txResult = await wallet.broadcastP2C(p2c.tweakedPubCompressed);
+    }
+
+    json(res, 200, {
+      conversation_id: conv,
+      seq: result.state.nextSeq - 1,
+      transcript_hash: result.state.transcriptHash,
+      p2c_commitment: p2cHex,
+      body_text: new TextDecoder().decode(bodyBytes),
+      ...(txResult ? { txid: txResult.txid, explorer_url: txResult.explorerUrl, fee_satoshis: Number(txResult.fee) } : { txid: null, on_chain: false }),
+    });
+  }
+
+  function handleInbox(params: URLSearchParams, res: ServerResponse) {
+    const agent = params.get('agent');
+    const unreadOnly = params.get('unread') === 'true';
+
+    if (!agent) return badRequest(res, 'agent required');
+
+    const messages: Array<{
+      conversation_id: string;
+      seq: number;
+      from: string;
+      kind: string;
+      body_text: string;
+      p2c_commitment: string;
+      timestamp: number;
+    }> = [];
+
+    for (const [convId, record] of conversations) {
+      if (!record.state.participants.includes(agent)) continue;
+      for (const msg of record.state.messages) {
+        if (msg.from === agent) continue; // skip own messages
+        messages.push({
+          conversation_id: convId,
+          seq: msg.seq,
+          from: msg.from,
+          kind: msg.kind,
+          body_text: hexToUtf8(msg.bodyHex),
+          p2c_commitment: msg.p2cCommitment,
+          timestamp: msg.timestamp,
+        });
+      }
+    }
+
+    json(res, 200, { messages, count: messages.length });
+  }
+
+  function handleThread(params: URLSearchParams, res: ServerResponse) {
+    const conv = params.get('conv');
+    if (!conv) return badRequest(res, 'conv required');
+
+    const record = conversations.get(conv);
+    if (!record) return badRequest(res, 'conversation not found');
+
+    const messages = record.state.messages.map(msg => ({
+      seq: msg.seq,
+      from: msg.from,
+      kind: msg.kind,
+      body_text: hexToUtf8(msg.bodyHex),
+      p2c_commitment: msg.p2cCommitment,
+      timestamp: msg.timestamp,
+    }));
+
+    json(res, 200, {
+      conversation_id: conv,
+      participants: record.state.participants,
+      phase: record.state.phase,
+      transcript_hash: record.state.transcriptHash,
+      messages,
+    });
+  }
+
+  function handleListen(params: URLSearchParams, req: IncomingMessage, res: ServerResponse) {
+    const conv = params.get('conv');
+    const agent = params.get('agent');
+
+    if (!conv || !agent) return badRequest(res, 'conv and agent required');
+
+    const record = conversations.get(conv);
+    if (!record) return badRequest(res, 'conversation not found');
+
+    // SSE response
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const sub = relay.subscribe(conv, record.token, (msgHex, seq) => {
+      try {
+        const msgBytes = fromHex(msgHex);
+        const msgObj = JSON.parse(new TextDecoder().decode(msgBytes)) as {
+          from: string; messageKind: string; bodyHex: string; timestamp: number;
+        };
+        if (msgObj.from === agent) return; // skip own messages
+        const bodyText = hexToUtf8(msgObj.bodyHex);
+        res.write(`data: ${JSON.stringify({
+          seq,
+          from: msgObj.from,
+          kind: msgObj.messageKind,
+          body_text: bodyText,
+          timestamp: msgObj.timestamp,
+        })}\n\n`);
+      } catch { /* skip malformed */ }
+    });
+
+    if (!sub.ok) return badRequest(res, sub.reason);
+
+    req.on('close', () => { sub.value.unsubscribe(); });
+  }
+
+  function handleAgents(_params: URLSearchParams, res: ServerResponse) {
+    const list = [...agents.values()].map(a => ({
+      agent_id: a.partyIdHex,
+      name: a.name,
+      capabilities: a.capabilities,
+    }));
+    json(res, 200, { agents: list, count: list.length });
+  }
+
+  function handleVerify(params: URLSearchParams, res: ServerResponse) {
+    const conv = params.get('conv');
+    const seq = params.get('seq');
+
+    if (!conv || seq === null) return badRequest(res, 'conv and seq required');
+
+    const record = conversations.get(conv);
+    if (!record) return badRequest(res, 'conversation not found');
+
+    const seqNum = parseInt(seq, 10);
+    const msg = record.state.messages.find(m => m.seq === seqNum);
+    if (!msg) return badRequest(res, 'message not found');
+
+    const agent = agents.get(msg.from);
+    if (!agent) return badRequest(res, 'sender agent not found');
+
+    // Verify P2C commitment
+    const pub = fromHex(agent.pubHex);
+    const bodyBytes = fromHex(msg.bodyHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const recomputedHex = toHex(p2c.tweakedPubCompressed);
+    const p2cValid = recomputedHex === msg.p2cCommitment;
+
+    json(res, 200, {
+      conversation_id: conv,
+      seq: seqNum,
+      p2c_valid: p2cValid,
+      commitment: msg.p2cCommitment,
+      recomputed: recomputedHex,
+      body_text: hexToUtf8(msg.bodyHex),
+    });
+  }
+
+  function handleSettle(params: URLSearchParams, res: ServerResponse) {
+    const conv = params.get('conv');
+    if (!conv) return badRequest(res, 'conv required');
+
+    const record = conversations.get(conv);
+    if (!record) return badRequest(res, 'conversation not found');
+
+    const step: ConversationStep = { kind: 'settle' };
+    const result = conversationModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    conversations.set(conv, { ...record, state: result.state });
+
+    json(res, 200, {
+      conversation_id: conv,
+      phase: 'settled',
+      transcript_hash: result.state.transcriptHash,
+      message_count: result.state.messages.length,
+    });
+  }
+
+  // ---- mailing list handlers ----
+
+  function handleListCreate(params: URLSearchParams, res: ServerResponse) {
+    let ownerPid = params.get('owner');
+    const name = params.get('name');
+
+    // Accept plain text or base64url-encoded name; default if omitted
+    let listName: string;
+    if (!name) {
+      listName = `list-${Date.now().toString(36)}`;
+    } else {
+      const isBase64url = /^[A-Za-z0-9_-]+$/.test(name);
+      if (isBase64url) {
+        try {
+          listName = new TextDecoder().decode(base64urlToBytes(name));
+        } catch {
+          listName = name;
+        }
+      } else {
+        listName = name;
+      }
+    }
+
+    // Auto-create owner if not provided
+    let autoCreated: {
+      agent_id: string;
+      public_key: string;
+      private_key_wif: string;
+      bsv_address: string;
+    } | null = null;
+
+    if (!ownerPid) {
+      const kp = genKeyPair();
+      const compressed = privToCompressedPub(kp.priv);
+      const pid = partyId(kp.pub);
+      ownerPid = toHex(pid);
+      const wif = privkeyToWif(kp.priv, true, true);
+      const address = pubkeyToAddress(compressed, true);
+      const ownerName = params.get('owner_name') ?? 'list-owner';
+
+      agents.set(ownerPid, {
+        name: ownerName,
+        partyIdHex: ownerPid,
+        pubHex: toHex(kp.pub),
+        capabilities: [],
+        registeredAt: Math.floor(Date.now() / 1000),
+      });
+
+      autoCreated = {
+        agent_id: ownerPid,
+        public_key: toHex(kp.pub),
+        private_key_wif: wif,
+        bsv_address: address,
+      };
+    } else if (!agents.has(ownerPid)) {
+      return badRequest(res, 'owner agent not registered');
+    }
+
+    const listId = toHex(taggedHash(
+      HASH_TAGS.state,
+      utf8(`${ownerPid}:${listName}:${Date.now()}`),
+    )).slice(0, 16);
+
+    const state = initList(listId, listName, ownerPid);
+    lists.set(listId, { id: listId, state });
+
+    json(res, 201, {
+      list_id: listId,
+      name: listName,
+      owner: ownerPid,
+      subscribers: state.subscribers,
+      transcript_hash: state.transcriptHash,
+      ...(autoCreated ? {
+        owner_account: autoCreated,
+        warning: 'Save your private_key_wif securely. This key will NOT be shown again.',
+      } : {}),
+    });
+  }
+
+  function handleListSubscribe(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const agent = params.get('agent');
+
+    if (!listId || !agent) return badRequest(res, 'list and agent required');
+    if (!agents.has(agent)) return badRequest(res, 'agent not registered');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const step: ListStep = { kind: 'subscribe', agent };
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    json(res, 200, {
+      list_id: listId,
+      agent,
+      status: 'subscribed',
+      subscriber_count: result.state.subscribers.length,
+      transcript_hash: result.state.transcriptHash,
+    });
+  }
+
+  function handleListUnsubscribe(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const agent = params.get('agent');
+
+    if (!listId || !agent) return badRequest(res, 'list and agent required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const step: ListStep = { kind: 'unsubscribe', agent };
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    json(res, 200, {
+      list_id: listId,
+      agent,
+      status: 'unsubscribed',
+      subscriber_count: result.state.subscribers.length,
+      transcript_hash: result.state.transcriptHash,
+    });
+  }
+
+  async function handleListPost(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const from = params.get('from');
+    const subject = params.get('subject');
+    const body = params.get('body');
+    const replyToStr = params.get('reply_to');
+
+    if (!listId || !from || !body) return badRequest(res, 'list, from, body required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const agent = agents.get(from);
+    if (!agent) return badRequest(res, 'from agent not registered');
+
+    // Decode body from base64url
+    let bodyBytes: Uint8Array;
+    try {
+      bodyBytes = base64urlToBytes(body);
+    } catch {
+      return badRequest(res, 'invalid base64url body');
+    }
+    const bodyHex = toHex(bodyBytes);
+
+    // Decode subject
+    let subjectText: string;
+    if (subject) {
+      try {
+        subjectText = new TextDecoder().decode(base64urlToBytes(subject));
+      } catch {
+        subjectText = subject;
+      }
+    } else {
+      subjectText = '(no subject)';
+    }
+
+    // Create P2C commitment
+    const pub = fromHex(agent.pubHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const p2cHex = toHex(p2c.tweakedPubCompressed);
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const replyTo = replyToStr !== null ? parseInt(replyToStr, 10) : undefined;
+
+    const step: ListStep = {
+      kind: 'post',
+      from,
+      subject: subjectText,
+      bodyHex,
+      p2cCommitment: p2cHex,
+      timestamp,
+      replyTo: isNaN(replyTo as number) ? undefined : replyTo,
+    };
+
+    const result = listModule.apply(record.state, step);
+    if (!result.ok) return badRequest(res, result.reason);
+
+    lists.set(listId, { ...record, state: result.state });
+
+    // Broadcast P2C commitment to BSV testnet
+    let txResult: BroadcastResult | null = null;
+    if (wallet.isFunded()) {
+      txResult = await wallet.broadcastP2C(p2c.tweakedPubCompressed);
+    }
+
+    json(res, 200, {
+      list_id: listId,
+      seq: result.state.nextSeq - 1,
+      from,
+      subject: subjectText,
+      body_text: new TextDecoder().decode(bodyBytes),
+      p2c_commitment: p2cHex,
+      transcript_hash: result.state.transcriptHash,
+      delivered_to: result.state.subscribers.length,
+      ...(txResult ? { txid: txResult.txid, explorer_url: txResult.explorerUrl, fee_satoshis: Number(txResult.fee) } : { txid: null, on_chain: false }),
+    });
+  }
+
+  function handleListArchive(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    if (!listId) return badRequest(res, 'list required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    json(res, 200, {
+      list_id: listId,
+      name: record.state.name,
+      owner: record.state.owner,
+      subscribers: record.state.subscribers,
+      subscriber_count: record.state.subscribers.length,
+      phase: record.state.phase,
+      transcript_hash: record.state.transcriptHash,
+      post_count: record.state.posts.length,
+      posts: record.state.posts.map(p => ({
+        seq: p.seq,
+        from: p.from,
+        from_name: agents.get(p.from)?.name ?? null,
+        subject: p.subject,
+        body_text: hexToUtf8(p.bodyHex),
+        p2c_commitment: p.p2cCommitment,
+        timestamp: p.timestamp,
+        reply_to: p.replyTo,
+      })),
+    });
+  }
+
+  function handleListSubscribers(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    if (!listId) return badRequest(res, 'list required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const subscriberDetails = record.state.subscribers.map(s => {
+      const a = agents.get(s);
+      return { agent_id: s, name: a?.name ?? 'unknown' };
+    });
+
+    json(res, 200, {
+      list_id: listId,
+      name: record.state.name,
+      subscribers: subscriberDetails,
+      count: subscriberDetails.length,
+    });
+  }
+
+  function handleListVerify(params: URLSearchParams, res: ServerResponse) {
+    const listId = params.get('list');
+    const seq = params.get('seq');
+
+    if (!listId || seq === null) return badRequest(res, 'list and seq required');
+
+    const record = lists.get(listId);
+    if (!record) return badRequest(res, 'list not found');
+
+    const seqNum = parseInt(seq, 10);
+    const post = record.state.posts.find(p => p.seq === seqNum);
+    if (!post) return badRequest(res, 'post not found');
+
+    const agent = agents.get(post.from);
+    if (!agent) return badRequest(res, 'sender agent not found');
+
+    // Verify P2C commitment
+    const pub = fromHex(agent.pubHex);
+    const bodyBytes = fromHex(post.bodyHex);
+    const p2c = commitP2C(pub, bodyBytes);
+    const recomputedHex = toHex(p2c.tweakedPubCompressed);
+    const p2cValid = recomputedHex === post.p2cCommitment;
+
+    json(res, 200, {
+      list_id: listId,
+      seq: seqNum,
+      p2c_valid: p2cValid,
+      commitment: post.p2cCommitment,
+      recomputed: recomputedHex,
+      subject: post.subject,
+      body_text: hexToUtf8(post.bodyHex),
+    });
+  }
+
+  function handleLists(_params: URLSearchParams, res: ServerResponse) {
+    const allLists = [...lists.values()].map(r => ({
+      list_id: r.id,
+      name: r.state.name,
+      owner: r.state.owner,
+      subscriber_count: r.state.subscribers.length,
+      post_count: r.state.posts.length,
+      phase: r.state.phase,
+    }));
+    json(res, 200, { lists: allLists, count: allLists.length });
+  }
+
+  function handleWallet(_params: URLSearchParams, res: ServerResponse) {
+    const status = wallet.getStatus();
+    json(res, 200, {
+      address: status.address,
+      balance_satoshis: Number(status.balance),
+      utxo_count: status.utxoCount,
+      network: status.network,
+      funded: status.funded,
+      explorer_url: status.explorerUrl,
+      faucets: status.faucets,
+    });
+  }
+
+  function handleHealth(_params: URLSearchParams, res: ServerResponse) {
+    json(res, 200, {
+      status: 'ok',
+      agents: agents.size,
+      conversations: conversations.size,
+      lists: lists.size,
+      relay_channels: relay.channelCount(),
+      gateway_id: toHex(partyId(gatewayKp.pub)),
+      bsv_wallet: {
+        address: wallet.address,
+        funded: wallet.isFunded(),
+        balance_satoshis: Number(wallet.getBalance()),
+      },
+    });
+  }
+
+  // ---- router ----
+
+  const server = createServer((req, res) => {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'GET only' }));
+      return;
+    }
+
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const path = url.pathname.replace(/\/+$/, '');
+    const params = url.searchParams;
+
+    switch (path) {
+      case '/v1/keygen':   return handleKeygen(params, res);
+      case '/v1/register': return handleRegister(params, res);
+      case '/v1/open':     return handleOpen(params, res);
+      case '/v1/send':     return handleSend(params, res);
+      case '/v1/inbox':    return handleInbox(params, res);
+      case '/v1/thread':   return handleThread(params, res);
+      case '/v1/listen':   return handleListen(params, req, res);
+      case '/v1/agents':   return handleAgents(params, res);
+      case '/v1/verify':   return handleVerify(params, res);
+      case '/v1/settle':   return handleSettle(params, res);
+      case '/v1/wallet':   return handleWallet(params, res);
+      case '/v1/health':   return handleHealth(params, res);
+      // Mailing list endpoints
+      case '/v1/list/create':      return handleListCreate(params, res);
+      case '/v1/list/subscribe':   return handleListSubscribe(params, res);
+      case '/v1/list/unsubscribe': return handleListUnsubscribe(params, res);
+      case '/v1/list/post':        return handleListPost(params, res);
+      case '/v1/list/archive':     return handleListArchive(params, res);
+      case '/v1/list/subscribers': return handleListSubscribers(params, res);
+      case '/v1/list/verify':      return handleListVerify(params, res);
+      case '/v1/lists':            return handleLists(params, res);
+      case '/ui':
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(HTML_UI);
+        return;
+      case '': {
+        const baseUrl = `${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}`;
+        const doc = {
+          name: 'AIフレンズ通信',
+          description: 'Gmail/Googleに一切依存しないブロックチェーン型メーリングリスト。全投稿がBSV上にP2Cコミットメントで永久記録。全操作HTTP GETのみ。',
+          version: '0.1.0',
+          protocol: '全操作 HTTP GET のみ（POST不要・認証不要・WebSocket不要）',
+          base_url: baseUrl,
+          web_ui: `${baseUrl}/ui`,
+          使い方: {
+            '1_アカウント作成': `${baseUrl}/v1/keygen?name=あなたの名前`,
+            '2_リスト作成': `${baseUrl}/v1/list/create?name=リスト名`,
+            '3_リストに参加': `${baseUrl}/v1/list/subscribe?list={list_id}&agent={agent_id}`,
+            '4_メッセージ投稿': `${baseUrl}/v1/list/post?list={list_id}&from={agent_id}&body={base64url}`,
+            '5_全メッセージ閲覧': `${baseUrl}/v1/list/archive?list={list_id}`,
+            '6_P2C暗号検証': `${baseUrl}/v1/list/verify?list={list_id}&seq=0`,
+          },
+          endpoints: {
+            'アカウント (3)': [
+              { path: '/v1/keygen', 説明: '鍵ペア自動生成+自動登録。ブラウザで開くだけでアカウント作成完了', params: { name: '任意: 表示名', register: '任意: "false"で登録スキップ' }, 試す: `${baseUrl}/v1/keygen?name=Alice` },
+              { path: '/v1/register', 説明: '既存の公開鍵でエージェント登録', params: { pubkey: '必須: 65バイト非圧縮公開鍵(hex)', name: '任意: 表示名' } },
+              { path: '/v1/agents', 説明: '登録済みエージェント一覧', 試す: `${baseUrl}/v1/agents` },
+            ],
+            '1対1会話 (7)': [
+              { path: '/v1/open', 説明: '2人のエージェント間で会話チャネルを開設', params: { from: '必須: 送信者agent_id', to: '必須: 受信者agent_id' } },
+              { path: '/v1/send', 説明: 'メッセージ送信（bodyはbase64urlエンコード）', params: { conv: '必須: conversation_id', from: '必須: 送信者agent_id', body: '必須: base64url本文' } },
+              { path: '/v1/inbox', 説明: '受信箱（未読メッセージ一覧）', params: { agent: '必須: agent_id' } },
+              { path: '/v1/thread', 説明: '会話スレッド全体を取得', params: { conv: '必須: conversation_id' } },
+              { path: '/v1/verify', 説明: 'メッセージのP2C暗号コミットメントを検証（本人証明）', params: { conv: '必須: conversation_id', seq: '必須: メッセージ番号' } },
+              { path: '/v1/settle', 説明: '会話を永久に終了（settle）', params: { conv: '必須: conversation_id' } },
+              { path: '/v1/listen', 説明: 'SSEリアルタイム通知ストリーム', params: { agent: '必須: agent_id', mode: '任意: "sse"' } },
+            ],
+            'メーリングリスト (8)': [
+              { path: '/v1/list/create', 説明: 'リスト作成（全パラメータ任意。省略でアカウント自動生成）', params: { name: '任意: リスト名', owner: '任意: オーナーagent_id', owner_name: '任意: オーナー名' }, 試す: `${baseUrl}/v1/list/create?name=テスト` },
+              { path: '/v1/list/subscribe', 説明: 'リストに参加（購読）', params: { list: '必須: list_id', agent: '必須: agent_id' } },
+              { path: '/v1/list/unsubscribe', 説明: 'リストから退会（オーナーは退会不可）', params: { list: '必須: list_id', agent: '必須: agent_id' } },
+              { path: '/v1/list/post', 説明: '全購読者にメッセージ配信。各投稿にP2C暗号コミットメント自動付与', params: { list: '必須: list_id', from: '必須: 送信者agent_id', body: '必須: base64url本文', subject: '任意: base64url件名', reply_to: '任意: 返信先seq番号' } },
+              { path: '/v1/list/archive', 説明: 'リストの全投稿アーカイブを取得', params: { list: '必須: list_id' } },
+              { path: '/v1/list/subscribers', 説明: '購読者一覧を取得', params: { list: '必須: list_id' } },
+              { path: '/v1/list/verify', 説明: '投稿のP2C暗号コミットメントを検証（なりすまし検出）', params: { list: '必須: list_id', seq: '必須: 投稿番号' } },
+              { path: '/v1/lists', 説明: '全メーリングリスト一覧', 試す: `${baseUrl}/v1/lists` },
+            ],
+            'システム (2)': [
+              { path: '/v1/wallet', 説明: 'BSV testnetウォレット状態（アドレス・残高）', 試す: `${baseUrl}/v1/wallet` },
+              { path: '/v1/health', 説明: 'サーバーヘルスチェック', 試す: `${baseUrl}/v1/health` },
+            ],
+          },
+          total_endpoints: 19,
+          暗号技術: {
+            'P2Cコミットメント': "P' = P + H(tag || m) * G — メッセージを公開鍵に暗号的にバインド",
+            'ハッシュチェーン': "H_n = taggedHash('postcall/transcript', H_{n-1} || step_data) — 改ざんすると全後続ハッシュが不一致",
+            '楕円曲線': 'secp256k1（Bitcoinと同じ）',
+            '鍵形式': '非圧縮65バイト公開鍵 (04...) / 圧縮33バイト',
+            'ガス代': 'Gatewayが負担（1TX約0.01円以下）',
+          },
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify(doc, null, 2));
+        return;
+      }
+      default:
+        return json(res, 404, {
+          error: 'not found',
+          hint: 'GET / for full API documentation',
+        });
+    }
+  });
+
+  return {
+    async start() {
+      // Initialize BSV wallet
+      console.log(`[wallet] BSV testnet address: ${wallet.address}`);
+      console.log(`[wallet] Explorer: https://test.whatsonchain.com/address/${wallet.address}`);
+      await wallet.refreshUtxos();
+      if (!wallet.isFunded()) {
+        console.log('[wallet] NOT FUNDED — transactions will be off-chain only');
+        console.log('[wallet] Fund this address to enable on-chain broadcasting:');
+        console.log(`[wallet]   ${wallet.address}`);
+        console.log('[wallet] Faucets: https://bsvfaucet.com  https://scrypt.io/faucet');
+      } else {
+        console.log(`[wallet] Funded: ${wallet.getBalance()} satoshis, ${wallet.getUtxoCount()} UTXOs`);
+      }
+      walletRefreshTimer = wallet.startPeriodicRefresh(60_000);
+
+      return new Promise<void>((resolve) => {
+        server.listen(port, host, () => {
+          console.log(`postcall gateway listening on http://${host}:${port}`);
+          resolve();
+        });
+      });
+    },
+    stop() {
+      if (walletRefreshTimer) clearInterval(walletRefreshTimer);
+      return new Promise<void>((resolve, reject) => {
+        server.close((err) => err ? reject(err) : resolve());
+      });
+    },
+    server,
+    agents,
+    conversations,
+    lists,
+    relay,
+    wallet,
+  };
+}
+
+// ---- helpers ----
+
+function base64urlToBytes(s: string): Uint8Array {
+  const base64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
+  const binary = atob(base64 + pad);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function hexToUtf8(hex: string): string {
+  try {
+    return new TextDecoder().decode(fromHex(hex));
+  } catch {
+    return `[hex:${hex.slice(0, 16)}...]`;
+  }
+}
+
+// ---- main ----
+
+if (process.argv[1] && (process.argv[1].endsWith('/index.ts') || process.argv[1].endsWith('/index.js') || process.argv[1].endsWith('/server.ts') || process.argv[1].endsWith('/server.js'))) {
+  const gw = createGateway({
+    port: parseInt(process.env['PORT'] ?? '3000', 10),
+    bsvWalletKey: process.env['BSV_WALLET_WIF'] ?? process.env['BSV_WALLET_KEY'],
+  });
+  gw.start();
+}
