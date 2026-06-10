@@ -457,12 +457,17 @@ export function createGateway(config: Partial<GatewayConfig> = {}) {
 
     if (!name) return badRequest(res, 'name required');
 
-    // Decode name from base64url if needed
+    // Accept plain text or base64url-encoded name
     let listName: string;
-    try {
-      listName = new TextDecoder().decode(base64urlToBytes(name));
-    } catch {
-      listName = name; // plain text fallback
+    const isBase64url = /^[A-Za-z0-9_-]+$/.test(name) && name.length > 0;
+    if (isBase64url) {
+      try {
+        listName = new TextDecoder().decode(base64urlToBytes(name));
+      } catch {
+        listName = name;
+      }
+    } else {
+      listName = name; // plain text (e.g. Japanese, spaces, etc.)
     }
 
     // Auto-create owner if not provided
